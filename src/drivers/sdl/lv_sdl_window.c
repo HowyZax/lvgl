@@ -256,6 +256,9 @@ static void sdl_event_handler(lv_timer_t * t)
                     lv_sdl_backend_ops.redraw(disp);
                     break;
                 case SDL_WINDOWEVENT_RESIZED:
+                    if(dsc->ignore_size_chg) {
+                        break;
+                    }
                     dsc->ignore_size_chg = 1;
                     int32_t hres = (int32_t)((float)(event.window.data1) / dsc->zoom);
                     int32_t vres = (int32_t)((float)(event.window.data2) / dsc->zoom);

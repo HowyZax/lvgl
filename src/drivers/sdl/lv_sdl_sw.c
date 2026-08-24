@@ -14,6 +14,10 @@
 
 #include "lv_sdl_private.h"
 
+#if defined(LVGLSIM_BEZEL_HOOK)
+bool lvglsim_bezel_redraw(lv_display_t * disp);
+#endif
+
 #if LV_USE_SDL && !LV_SDL_USE_EGL && !LV_USE_DRAW_SDL
 
 #ifndef _WIN32
@@ -177,6 +181,8 @@ static lv_result_t resize_display(lv_display_t * display)
     ddata->texture = SDL_CreateTexture(ddata->renderer, px_format,
                                        SDL_TEXTUREACCESS_STATIC, display->hor_res, display->ver_res);
     SDL_SetTextureBlendMode(ddata->texture, SDL_BLENDMODE_BLEND);
+    /* Nearest-neighbor when SDL stretches the FB into a zoomed window. */
+    SDL_SetTextureScaleMode(ddata->texture, SDL_ScaleModeNearest);
     return LV_RESULT_OK;
 }
 
@@ -323,6 +329,12 @@ static void flush_cb(lv_display_t * display, const lv_area_t * area, uint8_t * p
 
 static lv_result_t window_update(lv_display_t * display)
 {
+#if defined(LVGLSIM_BEZEL_HOOK)
+    if(lvglsim_bezel_redraw(display)) {
+        return LV_RESULT_OK;
+    }
+#endif
+
     lv_color_format_t cf = lv_display_get_color_format(display);
     lv_sdl_sw_display_data_t * ddata = lv_sdl_backend_get_display_data(display);
     if(cf == LV_COLOR_FORMAT_I1) {

@@ -13,6 +13,10 @@
 #include "../../stdlib/lv_string.h"
 #include "lv_sdl_private.h"
 
+#if defined(LVGLSIM_BEZEL_HOOK)
+void sim_bezel_map_pointer(lv_display_t * disp, int16_t * x, int16_t * y);
+#endif
+
 /*********************
  *      DEFINES
  *********************/
@@ -164,8 +168,8 @@ void lv_sdl_mouse_handler(SDL_Event * event)
         case SDL_MOUSEBUTTONDOWN:
             if(event->button.button == SDL_BUTTON_LEFT) {
                 indev_dev->left_button_down = true;
-                indev_dev->last_x = (int16_t)((float)(event->motion.x) / zoom);
-                indev_dev->last_y = (int16_t)((float)(event->motion.y) / zoom);
+                indev_dev->last_x = (int16_t)((float)(event->button.x) / zoom);
+                indev_dev->last_y = (int16_t)((float)(event->button.y) / zoom);
             }
             break;
         case SDL_MOUSEMOTION:
@@ -199,6 +203,9 @@ void lv_sdl_mouse_handler(SDL_Event * event)
 #endif /*LV_SDL_MOUSEWHEEL_MODE == LV_SDL_MOUSEWHEEL_MODE_CROWN*/
             break;
     }
+#if defined(LVGLSIM_BEZEL_HOOK)
+    sim_bezel_map_pointer(disp, &indev_dev->last_x, &indev_dev->last_y);
+#endif
     lv_indev_read(indev);
 }
 

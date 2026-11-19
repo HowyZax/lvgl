@@ -39,7 +39,7 @@
  *  STATIC PROTOTYPES
  **********************/
 static void lv_refr_join_area(void);
-static void refr_invalid_areas(void);
+static bool refr_invalid_areas(void);
 static void refr_sync_areas(void);
 static void refr_area(const lv_area_t * area_p, int32_t y_offset);
 static void refr_configured_layer(lv_layer_t * layer);
@@ -61,6 +61,18 @@ static bool alpha_test_area_on_obj(lv_obj_t * obj, const lv_area_t * area);
 /**********************
  *  STATIC VARIABLES
  **********************/
+
+/* QRX: a partial refresh returns to the caller about every 20 ms so keys can run.
+ * NULL callbacks (the simulator) draw the whole frame in one call. */
+void (*qrx_refr_slice_begin_cb)(void);
+bool (*qrx_refr_slice_due_cb)(void);
+
+static bool     s_slice_on;
+static int32_t  s_slice_i;
+static int32_t  s_slice_row;
+static int32_t  s_slice_y_off;
+static int32_t  s_slice_row_last;
+static int      s_refr_now_depth;
 
 /**********************
  *      MACROS
@@ -90,6 +102,8 @@ void lv_refr_now(lv_display_t * disp)
 {
     lv_anim_refr_now();
 
+    /* Finish the frame here. A sliced refresh would return with the panel half drawn. */
+    s_refr_now_depth++;
     if(disp) {
         if(disp->refr_timer) lv_display_refr_timer(disp->refr_timer);
     }
@@ -101,6 +115,7 @@ void lv_refr_now(lv_display_t * disp)
             d = lv_display_get_next(d);
         }
     }
+    s_refr_now_depth--;
 }
 
 void lv_obj_redraw(lv_layer_t * layer, lv_obj_t * obj)
@@ -399,26 +414,41 @@ void lv_display_refr_timer(lv_timer_t * tmr)
         return;
     }
 
-    /*Refresh the screen's layout if required*/
-    LV_PROFILER_LAYOUT_BEGIN_TAG("layout");
-    lv_obj_update_layout(disp_refr->act_scr);
-    if(disp_refr->prev_scr) lv_obj_update_layout(disp_refr->prev_scr);
+    /* A sliced refresh already joined these areas. Layout and join again would
+     * drop the rows that are still queued. */
+    if(!s_slice_on) {
+        /*Refresh the screen's layout if required*/
+        LV_PROFILER_LAYOUT_BEGIN_TAG("layout");
+        lv_obj_update_layout(disp_refr->act_scr);
+        if(disp_refr->prev_scr) lv_obj_update_layout(disp_refr->prev_scr);
 
-    lv_obj_update_layout(disp_refr->bottom_layer);
-    lv_obj_update_layout(disp_refr->top_layer);
-    lv_obj_update_layout(disp_refr->sys_layer);
-    LV_PROFILER_LAYOUT_END_TAG("layout");
+        lv_obj_update_layout(disp_refr->bottom_layer);
+        lv_obj_update_layout(disp_refr->top_layer);
+        lv_obj_update_layout(disp_refr->sys_layer);
+        LV_PROFILER_LAYOUT_END_TAG("layout");
 
-    /*Do nothing if there is no active screen*/
-    if(disp_refr->act_scr == NULL) {
-        disp_refr->inv_p = 0;
-        LV_LOG_WARN("there is no active screen");
-        goto refr_finish;
+        /*Do nothing if there is no active screen*/
+        if(disp_refr->act_scr == NULL) {
+            disp_refr->inv_p = 0;
+            LV_LOG_WARN("there is no active screen");
+            goto refr_finish;
+        }
+
+        lv_refr_join_area();
+        refr_sync_areas();
     }
 
-    lv_refr_join_area();
-    refr_sync_areas();
-    refr_invalid_areas();
+    if(qrx_refr_slice_begin_cb) qrx_refr_slice_begin_cb();
+    if(refr_invalid_areas()) {
+        /* Next lv_timer_handler continues the frame. last_run was stamped at entry. */
+        if(tmr) {
+            lv_timer_resume(tmr);
+            lv_timer_ready(tmr);
+        }
+        LV_TRACE_REFR("sliced");
+        LV_PROFILER_REFR_END;
+        return;
+    }
 
     if(disp_refr->inv_p == 0) goto refr_finish;
     /*In double buffered direct mode or if sync callback is set, save the updated areas.
@@ -776,13 +806,45 @@ static void refr_sync_areas(void)
 /**
  * Refresh the joined areas
  */
-static void refr_invalid_areas(void)
+/* True when this slice has used its time budget. lv_refr_now ignores the budget. */
+static bool qrx_slice_due(bool drew)
 {
-    if(disp_refr->inv_p == 0) return;
+    if(!drew || s_refr_now_depth > 0) return false;
+    if(qrx_refr_slice_due_cb == NULL) return false;
+    return qrx_refr_slice_due_cb();
+}
+
+static bool qrx_slice_pause(int32_t i, int32_t row, int32_t y_off, int32_t row_last)
+{
+    s_slice_on = true;
+    s_slice_i = i;
+    s_slice_row = row;
+    s_slice_y_off = y_off;
+    s_slice_row_last = row_last;
+    /* Key handling between slices invalidates widgets. That asserts while this flag is set. */
+    disp_refr->rendering_in_progress = false;
+    LV_PROFILER_REFR_END;
+    return true;
+}
+
+static bool refr_invalid_areas(void)
+{
+    if(disp_refr->inv_p == 0) {
+        s_slice_on = false;
+        return false;
+    }
     LV_PROFILER_REFR_BEGIN;
 
-    /*Notify the display driven rendering has started*/
-    lv_display_send_event(disp_refr, LV_EVENT_RENDER_START, NULL);
+    bool resume = s_slice_on;
+    /* An overflow invalidate replaces the queue with one full-screen area. */
+    if(resume && s_slice_i >= (int32_t)disp_refr->inv_p) {
+        resume = false;
+        s_slice_on = false;
+    }
+    if(!resume) {
+        /*Notify the display driven rendering has started*/
+        lv_display_send_event(disp_refr, LV_EVENT_RENDER_START, NULL);
+    }
 
     /*Find the last area which will be drawn*/
     int32_t i;
@@ -798,7 +860,10 @@ static void refr_invalid_areas(void)
     disp_refr->last_part = 0;
     disp_refr->rendering_in_progress = true;
 
-    for(i = 0; i < (int32_t)disp_refr->inv_p; i++) {
+    bool drew = false;
+    const int32_t i0 = resume ? s_slice_i : 0;
+
+    for(i = i0; i < (int32_t)disp_refr->inv_p; i++) {
         /*Refresh the unjoined areas*/
         if(disp_refr->inv_area_joined[i]) continue;
 
@@ -813,13 +878,19 @@ static void refr_invalid_areas(void)
 
             int32_t max_row = get_max_row(disp_refr, w, h);
 
-            int32_t row;
+            int32_t row = inv_a.y1;
             int32_t row_last = 0;
+            int32_t y_off = 0;
+            if(resume && i == s_slice_i) {
+                row = s_slice_row;
+                row_last = s_slice_row_last;
+                y_off = s_slice_y_off;
+            }
             lv_area_t sub_area;
             sub_area.x1 = inv_a.x1;
             sub_area.x2 = inv_a.x2;
-            int32_t y_off = 0;
-            for(row = inv_a.y1; row + max_row - 1 <= inv_a.y2; row += max_row) {
+            for(; row + max_row - 1 <= inv_a.y2; row += max_row) {
+                if(qrx_slice_due(drew)) return qrx_slice_pause(i, row, y_off, row_last);
                 /*Calc. the next y coordinates of draw_buf*/
                 sub_area.y1 = row;
                 sub_area.y2 = row + max_row - 1;
@@ -829,10 +900,12 @@ static void refr_invalid_areas(void)
                 refr_area(&sub_area, y_off);
                 y_off += lv_area_get_height(&sub_area);
                 draw_buf_flush(disp_refr);
+                drew = true;
             }
 
             /*If the last y coordinates are not handled yet ...*/
             if(inv_a.y2 != row_last) {
+                if(qrx_slice_due(drew)) return qrx_slice_pause(i, row, y_off, row_last);
                 /*Calc. the next y coordinates of draw_buf*/
                 sub_area.y1 = row;
                 sub_area.y2 = inv_a.y2;
@@ -840,19 +913,24 @@ static void refr_invalid_areas(void)
                 refr_area(&sub_area, y_off);
                 y_off += lv_area_get_height(&sub_area);
                 draw_buf_flush(disp_refr);
+                drew = true;
             }
         }
         else if(disp_refr->render_mode == LV_DISPLAY_RENDER_MODE_FULL ||
                 disp_refr->render_mode == LV_DISPLAY_RENDER_MODE_DIRECT) {
+            if(qrx_slice_due(drew)) return qrx_slice_pause(i, 0, 0, 0);
             disp_refr->last_part = 1;
             refr_area(&disp_refr->inv_areas[i], 0);
             draw_buf_flush(disp_refr);
+            drew = true;
         }
     }
 
+    s_slice_on = false;
     lv_display_send_event(disp_refr, LV_EVENT_RENDER_READY, NULL);
     disp_refr->rendering_in_progress = false;
     LV_PROFILER_REFR_END;
+    return false;
 }
 
 /**
